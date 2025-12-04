@@ -29,7 +29,13 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args): pass
 
 def start_web_server():
-    HTTPServer(("0.0.0.0", PORT), HealthCheckHandler).serve_forever()
+    # Bind to 0.0.0.0 to allow external health checks from Choreo
+    try:
+        server = HTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
+        print(f"🌍 Web server running on port {PORT}")
+        server.serve_forever()
+    except Exception as e:
+        print(f"❌ Web Server Error: {e}")
 
 # ------------------ HELPERS ------------------
 def progress_bar(pct, length=20):
@@ -51,7 +57,7 @@ def human_size(size):
         n += 1
     return f"{round(size, 2)} {units[n]}"
 
-# ------------------ STREAMING CLASS (FIXED) ------------------
+# ------------------ STREAMING CLASS ------------------
 class RDStream(io.IOBase):
     def __init__(self, stream, name, size):
         self.stream = stream
@@ -80,18 +86,21 @@ class RDStream(io.IOBase):
         return self.total_size
 
 # ------------------ PYROGRAM CLIENT ------------------
+# CRITICAL FIX: ipv6=False is required for Choreo/Heroku/Render
 app = Client(
     "rd_bot_session",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
     workers=4,
-    sleep_threshold=100
+    sleep_threshold=100,
+    ipv6=False  # <--- THIS FIXES THE CONNECTION TIMEOUT
 )
 
 # ------------------ UI PROGRESS CALLBACK ------------------
 async def upload_progress(current, total, message, start_time, filename):
     now = time.time()
+    # Update only every 5 seconds to avoid flooding Telegram API
     if now - getattr(message, "last_update", 0) > 5:
         pct = int(current / total * 100)
         elapsed = now - start_time
@@ -126,17 +135,14 @@ async def mirror(client, message):
     magnet = message.text.split(maxsplit=1)[1]
     msg = await message.reply_text("✨ Adding Torrent...")
     
-    # Add
     try:
         add = requests.post(f"{RD_API}/torrents/addMagnet", headers={"Authorization": f"Bearer {RD_TOKEN}"}, data={"magnet": magnet}).json()
         tid = add.get("id")
         if not tid: return await msg.edit_text("❌ Failed to add magnet.")
     except Exception as e: return await msg.edit_text(f"❌ Error: {e}")
     
-    # Select Files
     requests.post(f"{RD_API}/torrents/selectFiles/{tid}", headers={"Authorization": f"Bearer {RD_TOKEN}"}, data={"files": "all"})
     
-    # Wait Loop
     last_t = 0
     while True:
         info = requests.get(f"{RD_API}/torrents/info/{tid}", headers={"Authorization": f"Bearer {RD_TOKEN}"}).json()
@@ -149,7 +155,6 @@ async def mirror(client, message):
             last_t = time.time()
         await asyncio.sleep(2)
 
-    # Get Link
     try:
         link = requests.post(f"{RD_API}/unrestrict/link", headers={"Authorization": f"Bearer {RD_TOKEN}"}, data={"link": info['links'][0]}).json().get("download")
         await msg.edit_text(f"✅ **Complete!**\n📂 {info['filename']}\n🔗 `{link}`")
@@ -163,7 +168,6 @@ async def leech(client, message):
     magnet = message.text.split(maxsplit=1)[1]
     msg = await message.reply_text("✨ Processing...")
     
-    # 1. Add Magnet
     try:
         add = requests.post(f"{RD_API}/torrents/addMagnet", headers={"Authorization": f"Bearer {RD_TOKEN}"}, data={"magnet": magnet}).json()
         tid = add.get("id")
@@ -172,7 +176,6 @@ async def leech(client, message):
 
     requests.post(f"{RD_API}/torrents/selectFiles/{tid}", headers={"Authorization": f"Bearer {RD_TOKEN}"}, data={"files": "all"})
 
-    # 2. Wait for RD
     last_t = 0
     while True:
         info = requests.get(f"{RD_API}/torrents/info/{tid}", headers={"Authorization": f"Bearer {RD_TOKEN}"}).json()
@@ -185,7 +188,6 @@ async def leech(client, message):
             last_t = time.time()
         await asyncio.sleep(2)
 
-    # 3. Get Info
     try:
         data = requests.post(f"{RD_API}/unrestrict/link", headers={"Authorization": f"Bearer {RD_TOKEN}"}, data={"link": info['links'][0]}).json()
         link = data.get('download')
@@ -203,8 +205,8 @@ async def leech(client, message):
 
     await msg.edit_text(f"🚀 Init Stream...\n📄 {filename}\n📦 {human_size(filesize)}")
 
-    # 4. Stream
     try:
+        # Request with stream=True to prevent loading file into RAM
         with requests.get(link, stream=True) as r:
             r.raise_for_status()
             stream_obj = RDStream(r.raw, filename, filesize)
@@ -242,11 +244,10 @@ async def show_downloads_page(message, page):
         else: await message.reply_text(text)
         return
 
-    # Slice for current page
     current_list = torrents[offset : offset + limit]
     
     if not current_list and page > 0:
-        return await show_downloads_page(message, 0) # Reset to 0 if out of bounds
+        return await show_downloads_page(message, 0)
 
     buttons = []
     for t in current_list:
@@ -254,7 +255,6 @@ async def show_downloads_page(message, page):
         btn_text = f"{status_icon} {t['filename'][:25]}..."
         buttons.append([InlineKeyboardButton(btn_text, callback_data=f"INFO|{t['id']}")])
 
-    # Navigation Buttons
     nav_btns = []
     if page > 0:
         nav_btns.append(InlineKeyboardButton("⬅ Prev", callback_data=f"PAGE|{page-1}"))
@@ -286,7 +286,6 @@ async def cb_handler(client, query):
             
             link = "Unavailable"
             if info.get('links'):
-                # Try to get unrestrict link
                 try:
                     u = requests.post(f"{RD_API}/unrestrict/link", headers={"Authorization": f"Bearer {RD_TOKEN}"}, data={"link": info['links'][0]}).json()
                     link = u.get("download", "Unavailable")
@@ -318,6 +317,8 @@ async def cb_handler(client, query):
 
 # ------------------ START SERVER ------------------
 if __name__ == "__main__":
+    # Run the dummy web server in a separate thread so Choreo sees the app as "Healthy"
     threading.Thread(target=start_web_server, daemon=True).start()
     print("🚀 BOT RUNNING (PYROGRAM)")
+    # Blocking call to run the bot
     app.run()
